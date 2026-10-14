@@ -1,0 +1,215 @@
+name: Terraform GKE
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "k8s/**"
+      - ".github/workflows/terraform-gke.yml"
+
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "k8s/**"
+      - ".github/workflows/terraform-gke.yml"
+
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Opération Terraform"
+        required: true
+        type: choice
+        options:
+          - validate
+          - plan
+          - apply
+          - destroy
+        default: plan
+      confirm_destroy:
+        description: "Pour destroy, taper exactement DESTROY"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+jobs:
+
+  validate:
+    name: Validate Terraform
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.operation == 'validate' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize without remote state
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        run: terraform validate
+
+  plan:
+    name: Terraform Plan (manual)
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.operation == 'plan' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: terraform-state-${{ github.repository }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TF_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
+      - name: Terraform Init
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: terraform init -input=false -backend-config="bucket=${TF_STATE_BUCKET}"
+
+      - name: Terraform Plan
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_region: europe-west9
+        run: terraform plan -input=false -no-color
+
+  apply:
+    name: Terraform Apply
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.operation == 'apply' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+
+    environment: terraform-apply
+
+    concurrency:
+      group: terraform-state-${{ github.repository }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write
+
+    defaults:
+      run:
+        working-directory: infra
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TF_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
+      - name: Terraform Init
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: terraform init -input=false -backend-config="bucket=${TF_STATE_BUCKET}"
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Create plan
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_region: europe-west9
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Apply plan
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_region: europe-west9
+        run: terraform apply -input=false -auto-approve tfplan
+
+  destroy:
+    name: Terraform Destroy (MANUAL)
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'destroy' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    environment: terraform-destroy
+
+    concurrency:
+      group: terraform-state-${{ github.repository }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Require explicit confirmation
+        env:
+          CONFIRM_DESTROY: ${{ inputs.confirm_destroy }}
+        run: |
+          if [[ "$CONFIRM_DESTROY" != "DESTROY" ]]; then
+            echo "::error::Destruction annulée : saisis exactement DESTROY."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.6"
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TF_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+
+      - name: Terraform Init
+        working-directory: infra
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: terraform init -input=false -backend-config="bucket=${TF_STATE_BUCKET}"
+
+      - name: Destroy infrastructure
+        working-directory: infra
+        env:
+          TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_region: europe-west9
+        run: terraform destroy -input=false -auto-approve

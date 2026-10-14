@@ -5,3 +5,5 @@
 *.tfplan
 crash.log
 crash.*.log
+gha-creds-*.json
+gha-kubeconfig-*
